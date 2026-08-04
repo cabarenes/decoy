@@ -1,107 +1,48 @@
-"""
-decoy_simulation.py
-====================
-
-Stochastic simulation model for the *Decoy Location Problem* (DLP): estimating
-where an anti-radiation missile (ARM) detonates when its passive seeker's
-line-of-sight (LOS) estimate to a surface-based radar is corrupted by decoy
-transmitters deployed around the radar.
-
-This module implements exactly the five-step model logic described in the
-brief:
-
-    1. Set the locations of the radar, decoys, and the decision point.
-    2. Calculate the noiseless (true) LOS from the decision point to each
-       transmitter (radar + decoys).
-    3. Determine the noisy LOS for each transmitter (SNR-dependent Gaussian
-       error).
-    4. Combine the noisy LOS values into a single SNR-weighted LOS estimate.
-    5. Project the LOS estimate to the ground -> detonation point.
-
---------------------------------------------------------------------------
-ONE MODELING ASSUMPTION WORTH FLAGGING EXPLICITLY
---------------------------------------------------------------------------
-The brief cites a directional-antenna gain pattern "according to the model
-of a transmitter pattern (Schelkunoff 1943)" but does not give the closed
-form. Schelkunoff's 1943 array theory shows that a uniformly illuminated
-linear array/aperture produces a pattern whose continuous-angle limit is the
-classic squared-sinc ("Dirichlet kernel") shape, with a first sidelobe about
-13 dB below the main lobe. That is the standard, textbook Schelkunoff-style
-pattern, and is what `directional_pattern_gain()` below implements:
-
-    F(delta) = [ sin(u) / u ]^2 ,   u = c * delta / theta_3dB
-
-where `theta_3dB` is the antenna's -3 dB beamwidth and c is chosen so that
-F(theta_3dB / 2) = 0.5 exactly. The radar's total gain in a given direction
-is modeled as the peak gain times this pattern evaluated separately in the
-azimuth and elevation planes (a standard separable-pattern approximation):
-
-    G_radar(d_az, d_el) = G_peak * F(d_az; theta_az) * F(d_el; theta_el)
-
-The two -3 dB beamwidths (`RADAR_BEAMWIDTH_AZ_DEG`, `RADAR_BEAMWIDTH_EL_DEG`)
-are NOT stated in the brief, so they are exposed as tunable constants below
-(defaulted to a narrow, high-gain pencil beam consistent with the stated
-32 dB peak gain). If your source paper gives an explicit pattern formula or
-beamwidth/sidelobe numbers, replace `directional_pattern_gain()` and the two
-constants accordingly -- everything else in the model is independent of that
-choice.
-
-The decoys are explicitly stated to be omnidirectional with constant gain,
-so no pattern function is applied to them.
-"""
-
 from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
 
+#constants
 
-# ==========================================================================
-# 1. Fixed physical / model constants (as specified in the brief)
-# ==========================================================================
+WAVELENGTH = 0.1                 # lambda, 
+INTEGRATION_GAIN = 1.0           # I
+NOISE_TEMPERATURE = 290.0        # T
+TOTAL_LOSSES = 1.0               # L
+BOLTZMANN_K = 1.380649e-23       # k
 
-WAVELENGTH = 0.1                 # lambda, m
-INTEGRATION_GAIN = 1.0           # I, linear (0 dB)
-NOISE_TEMPERATURE = 290.0        # T, K
-TOTAL_LOSSES = 1.0               # L, linear (0 dB)
-BOLTZMANN_K = 1.380649e-23       # k, J/K
+# Seeker parameters
+SEEKER_GAIN = 3.0                # Gr
+SEEKER_BANDWIDTH_HZ = 1.0e6      # B
+SEEKER_NOISE_FIGURE = 30.0       # F
+SEEKER_BEAMWIDTH_DEG = 36.0      # theta
+K_M = 1.6                        # k_M
 
-# Seeker (missile receiver) parameters
-SEEKER_GAIN = 3.0                # Gr, linear (4.8 dB)
-SEEKER_BANDWIDTH_HZ = 1.0e6      # B, Hz (1 MHz)
-SEEKER_NOISE_FIGURE = 30.0       # F, linear (14.8 dB)
-SEEKER_BEAMWIDTH_DEG = 36.0      # theta, -3dB beamwidth used in error model
-K_M = 1.6                        # k_M, constant factor in error model
-
-# Transmitter peak (radiated) power
+# Transmitter peak power
 RADAR_PEAK_POWER_W = 50_000.0    # W
 DECOY_PEAK_POWER_W = 4_000.0     # W
 
 # Antenna peak gains
-RADAR_PEAK_GAIN = 1585.0         # linear (32.0 dB), shared peak of az & el cuts
-DECOY_GAIN_AZ = 2.0              # linear (3.0 dB), constant (omnidirectional)
-DECOY_GAIN_EL = 1.5              # linear (1.8 dB), constant (omnidirectional)
+RADAR_PEAK_GAIN = 1585.0         
+DECOY_GAIN_AZ = 2.0              
+DECOY_GAIN_EL = 1.5              
 
-# Radar directional-pattern beamwidths -- ASSUMPTION, see module docstring.
-# Tune these if your reference gives explicit values.
 RADAR_BEAMWIDTH_AZ_DEG = 3.0
 RADAR_BEAMWIDTH_EL_DEG = 3.0
 
 
-# ==========================================================================
-# 2. Geometry primitives
-# ==========================================================================
+
 
 @dataclass
 class Transmitter:
-    """A ground-based transmitter: either the radar or a single decoy."""
+    
     name: str
     x: float
     y: float
     kind: str                 # "radar" or "decoy"
-    peak_power: float = None  # W; defaults set in __post_init__ if omitted
-    z: float = 0.0            # ground level by default (flat terrain)
+    peak_power: float = None  # W
+    z: float = 0.0            # ground level by default 
 
     def __post_init__(self):
         if self.kind not in ("radar", "decoy"):
@@ -131,16 +72,6 @@ def compute_true_los(tx_x: float, tx_y: float,
     """
     Noiseless LOS (azimuth, elevation, range) from the decision point
     (dec_x, dec_y, dec_z) to a ground-level transmitter at (tx_x, tx_y, 0).
-
-    Azimuth is measured in the ground (x, y) plane via atan2(dy, dx).
-    Elevation is measured from the local horizontal at the decision point;
-    it is negative when the transmitter lies below the decision point
-    (the usual case, since the missile is elevated above the target array).
-
-    Returns
-    -------
-    az_true, el_true : float (radians)
-    R : float, slant range (m), R = sqrt(dx^2 + dy^2 + dec_z^2)
     """
     dx = tx_x - dec_x
     dy = tx_y - dec_y
@@ -154,13 +85,7 @@ def compute_true_los(tx_x: float, tx_y: float,
 
 def project_to_ground(dec_x: float, dec_y: float, dec_z: float,
                        az_est: float, el_est: float) -> Optional[Tuple[float, float]]:
-    """
-    Project the estimated LOS (azimuth, elevation) ray from the decision
-    point onto the ground plane z = 0, giving the detonation point.
 
-    Returns None if the estimated ray does not point downward (a degenerate
-    case that should be rare given realistic geometries / errors).
-    """
     dx = np.cos(el_est) * np.cos(az_est)
     dy = np.cos(el_est) * np.sin(az_est)
     dz = np.sin(el_est)
@@ -171,12 +96,8 @@ def project_to_ground(dec_x: float, dec_y: float, dec_z: float,
     y_det = dec_y + t * dy
     return x_det, y_det
 
+# Antenna gain pattern (Schelkunoff-style squared-sinc), SNR, error model
 
-# ==========================================================================
-# 3. Antenna gain pattern (Schelkunoff-style squared-sinc), SNR, error model
-# ==========================================================================
-
-# Solves [sin(c/2)/(c/2)]^2 = 0.5  ->  c/2 = 1.391549...  (standard sinc-2 result)
 _BEAMWIDTH_SCALE = 2.783099
 
 def _sinc2(u: np.ndarray) -> np.ndarray:
@@ -188,24 +109,12 @@ def _sinc2(u: np.ndarray) -> np.ndarray:
 
 
 def directional_pattern_gain(delta_angle_rad: float, beamwidth_rad: float) -> float:
-    """
-    Normalized (peak = 1 at delta_angle = 0) directional antenna pattern,
-    following the continuous-aperture limit of Schelkunoff's (1943) uniform
-    array factor (squared sinc / Dirichlet-kernel shape). See module
-    docstring for the reasoning and how to swap in an exact formula.
-    """
     u = _BEAMWIDTH_SCALE * delta_angle_rad / beamwidth_rad
     return _sinc2(u)
 
 
 def radar_antenna_gain(seeker_az_from_tx: float, seeker_el_from_tx: float,
                         radar_bearing_rad: float) -> float:
-    """
-    Total radar antenna gain toward the seeker, given the seeker's direction
-    as seen FROM the radar (azimuth/elevation) and the radar's antenna
-    boresight bearing (elevation boresight assumed 0, i.e. pointed at the
-    horizon).
-    """
     d_az = wrap_to_pi(seeker_az_from_tx - radar_bearing_rad)
     d_el = seeker_el_from_tx  # boresight elevation = 0
     g_az = directional_pattern_gain(d_az, np.radians(RADAR_BEAMWIDTH_AZ_DEG))
@@ -214,17 +123,11 @@ def radar_antenna_gain(seeker_az_from_tx: float, seeker_el_from_tx: float,
 
 
 def decoy_antenna_gain() -> float:
-    """Decoys are omnidirectional: constant gain regardless of viewing angle."""
     return DECOY_GAIN_AZ * DECOY_GAIN_EL
 
 
 def compute_snr(peak_power_w: float, gain_tx: float, gain_seeker: float,
                  range_m: float) -> float:
-    """
-    Equation (1): one-way link SNR at the seeker from a transmitter with
-    peak power `peak_power_w`, transmit gain `gain_tx`, at slant range
-    `range_m`, received by the seeker with gain `gain_seeker`.
-    """
     numerator = peak_power_w * gain_tx * gain_seeker * WAVELENGTH**2 * INTEGRATION_GAIN
     denominator = (
         (4 * np.pi * range_m) ** 2
@@ -237,49 +140,23 @@ def compute_snr(peak_power_w: float, gain_tx: float, gain_seeker: float,
 def measurement_error_std(snr: float,
                            theta_deg: float = SEEKER_BEAMWIDTH_DEG,
                            k_m: float = K_M) -> float:
-    """
-    Equation (3): standard deviation (radians) of the SNR-dependent LOS
-    measurement error for a single transmitter, sigma_n = theta / (k_M * sqrt(2*SNR)).
-    """
     theta_rad = np.radians(theta_deg)
     return theta_rad / (k_m * np.sqrt(2.0 * snr))
 
 
 def weighted_los_estimate(los_values: np.ndarray, snrs: np.ndarray) -> float:
-    """Equation (4): SNR-weighted average of the noisy LOS values."""
     los_values = np.asarray(los_values, dtype=float)
     snrs = np.asarray(snrs, dtype=float)
     return float(np.sum(los_values * snrs) / np.sum(snrs))
 
-
-# ==========================================================================
-# 4. Single-trial and Monte Carlo simulation
-# ==========================================================================
+# Single-trial and Monte Carlo simulation
 
 def run_single_trial(radar: Transmitter, decoys: List[Transmitter],
                       decision_point: Tuple[float, float, float],
                       rng: np.random.Generator,
                       radar_bearing_rad: Optional[float] = None
                       ) -> Dict[str, Any]:
-    """
-    Run one Monte Carlo replication of the DLP simulation model (steps 1-5).
 
-    Parameters
-    ----------
-    radar : Transmitter (kind="radar")
-    decoys : list of Transmitter (kind="decoy")
-    decision_point : (xdec, ydec, zdec)
-    rng : numpy Generator, source of randomness for this trial
-    radar_bearing_rad : optional fixed radar bearing; if None, drawn
-        uniformly from [0, 2*pi) as specified (the first source of
-        uncertainty in the model).
-
-    Returns
-    -------
-    dict with per-transmitter intermediate values, the LOS estimate, and
-    the resulting detonation point (None if the projected ray does not
-    point at the ground).
-    """
     dec_x, dec_y, dec_z = decision_point
     transmitters = [radar] + list(decoys)
 
@@ -298,8 +175,6 @@ def run_single_trial(radar: Transmitter, decoys: List[Transmitter],
         P[i] = tx.peak_power
 
         if tx.kind == "radar":
-            # Direction of the seeker AS SEEN FROM the radar is the reverse
-            # of the decision-point-to-radar LOS.
             az_from_tx = wrap_to_pi(az_t + np.pi)
             el_from_tx = -el_t
             G[i] = radar_antenna_gain(az_from_tx, el_from_tx, radar_bearing_rad)
@@ -309,8 +184,6 @@ def run_single_trial(radar: Transmitter, decoys: List[Transmitter],
     SNR = compute_snr(P, G, SEEKER_GAIN, R)
     sigma_n = measurement_error_std(SNR)
 
-    # Unwrap azimuth values relative to the radar's true azimuth before
-    # weighted-averaging, to avoid +-pi wraparound artifacts.
     az_ref = az_true[0]
     az_true_unwrapped = az_ref + wrap_to_pi(az_true - az_ref)
 
@@ -336,7 +209,6 @@ def run_monte_carlo(radar: Transmitter, decoys: List[Transmitter],
                      decision_point: Tuple[float, float, float],
                      n_trials: int = 10_000,
                      seed: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Run `n_trials` independent replications and return the raw results."""
     rng = np.random.default_rng(seed)
     return [run_single_trial(radar, decoys, decision_point, rng)
             for _ in range(n_trials)]
@@ -345,11 +217,7 @@ def run_monte_carlo(radar: Transmitter, decoys: List[Transmitter],
 def summarize_results(results: List[Dict[str, Any]],
                        radar: Transmitter,
                        decoys: List[Transmitter]) -> "pd.DataFrame":
-    """
-    Turn raw Monte Carlo trial results into a tidy pandas DataFrame with one
-    row per trial: detonation coordinates, distance from radar, and distance
-    from the nearest decoy.
-    """
+                       
     import pandas as pd
 
     rows = []
@@ -373,20 +241,6 @@ def summarize_results(results: List[Dict[str, Any]],
             "radar_bearing_deg": np.degrees(r["radar_bearing_rad"]),
         })
     return pd.DataFrame(rows)
-
-if __name__ == "__main__":
-    radar = make_radar(0, 0)
-    decoys = [
-        make_decoy(100, 450, "decoy_1"),
-        make_decoy(-200, 400, "decoy_2"),
-    ]
-    decision_point = (0, 800, 500)
-
-    results = run_monte_carlo(
-        radar, decoys, decision_point,
-        n_trials=100, seed=42
-    )
-    print(summarize_results(results, radar, decoys).describe())
 
 def plot_simulation(results, radar, decoys, decision_point):
     import matplotlib.pyplot as plt
@@ -422,4 +276,20 @@ def plot_simulation(results, radar, decoys, decision_point):
     ax.legend()
     plt.show()
 
-plot_simulation(results, radar, decoys, decision_point)
+    
+if __name__ == "__main__":
+    radar = make_radar(0, 0)
+    decoys = [
+        make_decoy(100, 450, "decoy_1"),
+        make_decoy(-200, 400, "decoy_2"),
+    ]
+    decision_point = (0, 800, 500)
+
+    results = run_monte_carlo(
+        radar, decoys, decision_point,
+        n_trials=100, seed=42
+    )
+    print(summarize_results(results, radar, decoys).describe())
+    plot_simulation(results, radar, decoys, decision_point)
+
+
